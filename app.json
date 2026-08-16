@@ -2,6 +2,7 @@
   "expo": {
     "name": "DooDoo",
     "slug": "doodoo",
+    "scheme": "doodoo",
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -17,6 +18,10 @@
     "android": {},
     "web": {
       "bundler": "metro"
-    }
+    },
+    "plugins": [
+      "expo-web-browser",
+      "expo-notifications"
+    ]
   }
 }

@@ -1,6 +1,5 @@
 export function taskToSupabase(task, userId) {
-  return {
-    id: task.id,
+  const row = {
     user_id: userId,
     title: task.title,
     date: task.date,
@@ -12,11 +11,19 @@ export function taskToSupabase(task, userId) {
     end_time: task.endTime,
     reminder_type: task.reminderType,
     reminder_time: task.reminderTime,
+    notification_id: task.notificationId,
+    sort_order: task.sortOrder,
     memo: task.memo,
     is_completed: task.isCompleted ?? task.done,
     created_at: task.createdAt,
     updated_at: task.updatedAt
   };
+
+  if (typeof task.id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(task.id)) {
+    row.id = task.id;
+  }
+
+  return row;
 }
 
 export function taskFromSupabase(row) {
@@ -32,6 +39,9 @@ export function taskFromSupabase(row) {
     endTime: row.end_time,
     reminderType: row.reminder_type,
     reminderTime: row.reminder_time,
+    reminderDate: row.reminder_date || null,
+    notificationId: row.notification_id,
+    sortOrder: row.sort_order ?? null,
     memo: row.memo || "",
     done: row.is_completed,
     isCompleted: row.is_completed,
@@ -41,8 +51,7 @@ export function taskFromSupabase(row) {
 }
 
 export function categoryToSupabase(category, userId, sortOrder = 0) {
-  return {
-    id: category.id,
+  const row = {
     user_id: userId,
     name: category.name,
     color: category.color,
@@ -50,6 +59,12 @@ export function categoryToSupabase(category, userId, sortOrder = 0) {
     created_at: category.createdAt,
     updated_at: category.updatedAt
   };
+
+  if (typeof category.id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(category.id)) {
+    row.id = category.id;
+  }
+
+  return row;
 }
 
 export function categoryFromSupabase(row) {

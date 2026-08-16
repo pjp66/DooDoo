@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   Easing,
+  Keyboard,
   KeyboardAvoidingView,
   Modal,
   PanResponder,
@@ -19,7 +20,35 @@ import {
 import { StatusBar } from "expo-status-bar";
 import * as Haptics from "expo-haptics";
 import { loadStoredJson, removeStoredItem, saveStoredJson } from "./src/storage/localStore";
-import { loadCategories, loadTasks, saveCategories, saveTasks } from "./src/repositories/taskRepository";
+import {
+  createCategory,
+  createTask,
+  deleteCategoryById,
+  deleteTaskById,
+  loadCategories,
+  loadTasks,
+  saveCategories,
+  saveTasks,
+  updateCategory,
+  updateCategoryOrder,
+  updateTask
+} from "./src/repositories/taskRepository";
+import {
+  getAuthErrorMessage,
+  getCurrentAuthSession,
+  isEmail,
+  signInWithGoogle,
+  signInWithEmail,
+  signOutFromSupabase,
+  signUpWithEmail,
+  subscribeAuthStateChange
+} from "./src/services/authService";
+import {
+  cancelAllTaskNotifications,
+  cancelTaskNotification,
+  prepareTaskNotification,
+  resyncTaskNotifications
+} from "./src/services/notificationService";
 
 const BLUE = "#4f6ff0";
 const BG = "#f4f7fc";
@@ -63,6 +92,9 @@ const weekEn = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const WHEEL_ITEM_HEIGHT = 46;
 const WHEEL_VISIBLE_ITEMS = 5;
 const WHEEL_REPEAT_COUNT = 9;
+const FIELD_ROW_HEIGHT = 80;
+let activeMultilineFocusHandler = null;
+let activeMultilineBlurHandler = null;
 
 const pad = (n) => String(n).padStart(2, "0");
 const keyOf = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
@@ -108,50 +140,87 @@ const buildTime = (period, hour, minute) => {
 };
 const formatClock = (time) => {
   if (!time) return "";
-  const [hour, minute] = time.split(":").map(Number);
-  const period = hour < 12 ? "오전" : "오후";
+  const [hour, minute] = String(time).split(":").map(Number);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return "";
+  const period = hour < 12 ? "\uC624\uC804" : "\uC624\uD6C4";
   const displayHour = hour % 12 || 12;
   return `${period} ${displayHour}:${pad(minute)}`;
 };
-const playSelectionHaptic = () => {
-  Haptics.selectionAsync().catch(() => {});
-};
-const timeToMinutes = (time) => {
-  const [hour, minute] = (time || "09:00").split(":").map(Number);
-  return (Number.isFinite(hour) ? hour : 9) * 60 + (Number.isFinite(minute) ? minute : 0);
-};
-const minutesToTime = (minutes) => {
-  const normalized = ((minutes % 1440) + 1440) % 1440;
-  return `${pad(Math.floor(normalized / 60))}:${pad(normalized % 60)}`;
-};
-const addMinutes = (time, minutes) => minutesToTime(timeToMinutes(time) + minutes);
 const formatTaskTime = (task) => {
-  if (task.isAllDay) return "종일";
-  if (task.startDate && task.startTime && task.endDate && task.endTime) {
-    const sameDate = task.startDate === task.endDate;
-    const dateLabel = sameDate ? "" : `${prettyDate(task.startDate)} `;
-    return `${dateLabel}${formatClock(task.startTime)} - ${sameDate ? "" : `${prettyDate(task.endDate)} `}${formatClock(task.endTime)}`;
+  if (!task) return "";
+  if (task.isAllDay) return "\uC885\uC77C";
+  const startTime = task.startTime || task.start_time || "";
+  const endTime = task.endTime || task.end_time || "";
+  const startDate = task.startDate || task.start_date || task.date || "";
+  const endDate = task.endDate || task.end_date || task.date || "";
+  if (startTime && endTime) {
+    const sameDate = !startDate || !endDate || startDate === endDate;
+    const dateLabel = sameDate ? "" : `${prettyDate(startDate)} `;
+    const endDateLabel = sameDate ? "" : `${prettyDate(endDate)} `;
+    return `${dateLabel}${formatClock(startTime)} ~ ${endDateLabel}${formatClock(endTime)}`;
   }
-  if (task.startDate && task.startTime) return `${prettyDate(task.startDate)} ${formatClock(task.startTime)}`;
+  if (startTime) return formatClock(startTime);
   return task.time || "";
 };
-const formatReminder = (task) => {
-  if (task.reminderType === "custom") {
-    return task.reminderTime ? `직접 설정 ${formatClock(task.reminderTime)}` : "직접 알림 시간 필요";
+const getReminderActualDate = (task) => {
+  if (!task) return null;
+  const reminderType = task.reminderType || task.reminder_type || "none";
+  const reminderTimeValue = task.reminderTime || task.reminder_time || "";
+  const reminderDateValue = task.reminderDate || task.reminder_date || task.date || "";
+  if (reminderType === "none") return null;
+  if (reminderType === "custom") {
+    if (!reminderTimeValue) return null;
+    return { dateKey: reminderDateValue, time: reminderTimeValue };
   }
-  const option = reminderOptions.find((item) => item.type === task.reminderType);
-  return option?.label || task.alarm || "알림 없음";
+  const startTime = task.startTime || task.start_time || "";
+  if (!startTime || task.isAllDay || task.is_all_day) return null;
+  const offsetMap = { at_start: 0, before_5: 5, before_10: 10, before_30: 30, before_60: 60 };
+  if (!(reminderType in offsetMap)) return null;
+  const dateKey = task.startDate || task.start_date || task.date;
+  const [year, month, day] = String(dateKey).split("-").map(Number);
+  const [hour, minute] = String(startTime).split(":").map(Number);
+  if (![year, month, day, hour, minute].every(Number.isFinite)) return null;
+  const triggerDate = new Date(year, month - 1, day, hour, minute);
+  triggerDate.setMinutes(triggerDate.getMinutes() - offsetMap[reminderType]);
+  return { dateKey: keyOf(triggerDate), time: `${pad(triggerDate.getHours())}:${pad(triggerDate.getMinutes())}` };
+};
+const formatReminderTime = (task) => {
+  const reminder = getReminderActualDate(task);
+  if (!reminder) return "";
+  const needsDate = reminder.dateKey && task.date && reminder.dateKey !== task.date;
+  return `${needsDate ? `${prettyDate(reminder.dateKey)} ` : ""}${formatClock(reminder.time)}`;
+};
+const formatReminder = (task) => {
+  if (!task) return "\uC54C\uB9BC \uC5C6\uC74C";
+  const reminderType = task.reminderType || task.reminder_type || "none";
+  if (reminderType === "none") return "\uC54C\uB9BC \uC5C6\uC74C";
+  const reminderTime = formatReminderTime(task);
+  if (reminderType === "custom") {
+    return reminderTime ? `${reminderTime} \u00b7 \uC9C1\uC811 \uC124\uC815` : "\uC9C1\uC811 \uC124\uC815";
+  }
+  const option = reminderOptions.find((item) => item.type === reminderType);
+  if (!option) return task.alarm || "\uC54C\uB9BC \uC5C6\uC74C";
+  return reminderTime ? `${reminderTime} \u00b7 ${option.label}` : option.label;
 };
 const hasStructuredTime = (task) => task.isAllDay || Boolean(task.startDate || task.startTime || task.endDate || task.endTime);
+const loginProviderLabel = (provider) => {
+  if (provider === "google") return "Google";
+  if (provider === "email") return "이메일";
+  return provider || "이메일";
+};
 
 export default function App() {
   const [screen, setScreen] = useState("login");
   const [session, setSession] = useState(null);
+  const [user, setUser] = useState(null);
+  const [authSession, setAuthSession] = useState(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [users, setUsers] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [fields, setFields] = useState(defaultFields);
   const [notifications, setNotifications] = useState(true);
-  const [selectedDate, setSelectedDate] = useState("2026-08-06");
+  const [selectedDate, setSelectedDate] = useState(() => todayKey());
   const [calendarMode, setCalendarMode] = useState("month");
   const [taskSheetMode, setTaskSheetMode] = useState(null);
   const [editingTask, setEditingTask] = useState(null);
@@ -161,32 +230,71 @@ export default function App() {
 
   useEffect(() => {
     async function boot() {
-      const [savedSession, savedUsers, savedTasks, savedFields, savedNotifications] = await Promise.all([
+      const authResult = await getCurrentAuthSession();
+      const [savedSession, savedUsers, savedNotifications] = await Promise.all([
         loadStoredJson("session", null),
         loadStoredJson("users", []),
-        loadTasks(),
-        loadCategories(),
         loadStoredJson("notifications", true)
       ]);
+      const nextSession = authResult.appSession || savedSession;
+      const savedFields = await loadCategories(authResult.user?.id, defaultFields);
       const nextFields = normalizeFields(savedFields?.length ? savedFields : defaultFields);
-      setSession(savedSession);
+      const nextTasks = await loadTasks(authResult.user?.id);
+      const normalizedLoadedTasks = normalizeTasks(nextTasks || [], nextFields);
+      const syncedTasks = savedNotifications
+        ? await resyncTaskNotifications(normalizedLoadedTasks)
+        : normalizedLoadedTasks;
+      setAuthSession(authResult.authSession);
+      setUser(authResult.user);
+      setSession(nextSession);
       setUsers(savedUsers);
-      setTasks(normalizeTasks(savedTasks || [], nextFields));
+      setTasks(normalizeTasks(syncedTasks, nextFields));
       setFields(nextFields);
       setNotifications(savedNotifications);
-      setScreen(savedSession ? "main" : "login");
+      if (authResult.appSession) await saveStoredJson("session", authResult.appSession);
+      setScreen(nextSession ? "main" : "login");
       setBooted(true);
     }
     boot();
   }, []);
 
   useEffect(() => {
-    if (booted) saveTasks(tasks);
-  }, [tasks, booted]);
+    const unsubscribe = subscribeAuthStateChange(async (nextAuth) => {
+      setAuthSession(nextAuth.authSession);
+      setUser(nextAuth.user);
+      setSession(nextAuth.appSession);
+      if (nextAuth.appSession) {
+        const remoteFields = normalizeFields(await loadCategories(nextAuth.user?.id, defaultFields));
+        const remoteTasks = await loadTasks(nextAuth.user?.id);
+        const savedNotifications = await loadStoredJson("notifications", true);
+        const normalizedRemoteTasks = normalizeTasks(remoteTasks || [], remoteFields);
+        const syncedRemoteTasks = savedNotifications
+          ? await resyncTaskNotifications(normalizedRemoteTasks)
+          : normalizedRemoteTasks;
+        setFields(remoteFields);
+        setTasks(normalizeTasks(syncedRemoteTasks, remoteFields));
+        await saveStoredJson("session", nextAuth.appSession);
+        setScreen((current) => (current === "login" || current === "signup" ? "main" : current));
+      } else {
+        const localFields = normalizeFields((await loadCategories()) || defaultFields);
+        const localTasks = await loadTasks();
+        await cancelAllTaskNotifications();
+        setFields(localFields);
+        setTasks(normalizeTasks(localTasks || [], localFields));
+        await removeStoredItem("session");
+        setScreen((current) => (current === "settings" || current === "fields" || current === "main" ? "login" : current));
+      }
+    });
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
-    if (booted) saveCategories(fields);
-  }, [fields, booted]);
+    if (booted) saveTasks(tasks, user?.id);
+  }, [tasks, booted, user?.id]);
+
+  useEffect(() => {
+    if (booted) saveCategories(fields, user?.id);
+  }, [fields, booted, user?.id]);
 
   useEffect(() => {
     if (booted) saveStoredJson("notifications", notifications);
@@ -195,48 +303,143 @@ export default function App() {
   const selectedTask = tasks.find((task) => task.id === detailTaskId);
 
   const login = async ({ username, password }) => {
-    if (!username.trim() || !password.trim()) {
-      Alert.alert("로그인", "아이디와 비밀번호를 입력해주세요.");
+    const email = username.trim();
+    setAuthError("");
+    if (!email) {
+      setAuthError("이메일을 입력해주세요.");
+      Alert.alert("로그인", "이메일을 입력해주세요.");
       return;
     }
-    const found = users.find((user) => user.username === username.trim());
-    if (users.length && (!found || found.password !== password)) {
-      Alert.alert("로그인 실패", "계정 정보를 확인해주세요.");
+    if (!isEmail(email)) {
+      setAuthError("올바른 이메일 형식이 아니에요.");
+      Alert.alert("로그인", "올바른 이메일 형식이 아니에요.");
       return;
     }
-    const nextSession = {
-      username: username.trim(),
-      nickname: found?.nickname || username.trim(),
-      email: found?.email || `${username.trim()}@doodoo.app`,
-      loginType: "email"
-    };
-    setSession(nextSession);
-    await saveStoredJson("session", nextSession);
-    setScreen("main");
+    if (!password) {
+      setAuthError("비밀번호를 입력해주세요.");
+      Alert.alert("로그인", "비밀번호를 입력해주세요.");
+      return;
+    }
+
+    setIsAuthLoading(true);
+    try {
+      const result = await signInWithEmail({ email, password });
+      setAuthSession(result.authSession);
+      setUser(result.user);
+      setSession(result.appSession);
+      const remoteFields = normalizeFields(await loadCategories(result.user?.id, defaultFields));
+      const remoteTasks = await loadTasks(result.user?.id);
+      const normalizedRemoteTasks = normalizeTasks(remoteTasks || [], remoteFields);
+      const syncedRemoteTasks = notifications
+        ? await resyncTaskNotifications(normalizedRemoteTasks)
+        : normalizedRemoteTasks;
+      setFields(remoteFields);
+      setTasks(normalizeTasks(syncedRemoteTasks, remoteFields));
+      await saveStoredJson("session", result.appSession);
+      if (result.profileError) {
+        Alert.alert("프로필 안내", "로그인은 성공했지만 프로필 저장 확인이 필요해요. Supabase profiles RLS 정책을 확인해주세요.");
+      }
+      setScreen("main");
+    } catch (error) {
+      const message = getAuthErrorMessage(error);
+      setAuthError(message);
+      Alert.alert("로그인 실패", message);
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const loginWithGoogle = async () => {
+    setAuthError("");
+    setIsAuthLoading(true);
+    try {
+      const result = await signInWithGoogle();
+      setAuthSession(result.authSession);
+      setUser(result.user);
+      setSession(result.appSession);
+      const remoteFields = normalizeFields(await loadCategories(result.user?.id, defaultFields));
+      const remoteTasks = await loadTasks(result.user?.id);
+      const normalizedRemoteTasks = normalizeTasks(remoteTasks || [], remoteFields);
+      const syncedRemoteTasks = notifications
+        ? await resyncTaskNotifications(normalizedRemoteTasks)
+        : normalizedRemoteTasks;
+      setFields(remoteFields);
+      setTasks(normalizeTasks(syncedRemoteTasks, remoteFields));
+      await saveStoredJson("session", result.appSession);
+      if (result.profileError) {
+        Alert.alert("프로필 안내", "Google 로그인은 성공했지만 프로필 저장 확인이 필요해요. Supabase profiles RLS 정책을 확인해주세요.");
+      }
+      setScreen("main");
+    } catch (error) {
+      const message = getAuthErrorMessage(error);
+      setAuthError(message);
+      Alert.alert("Google 로그인 실패", message);
+    } finally {
+      setIsAuthLoading(false);
+    }
   };
 
   const signup = async ({ username, password, confirm, nickname }) => {
-    if (!username.trim() || !password.trim() || !nickname.trim()) {
-      Alert.alert("회원가입", "필수 정보를 모두 입력해주세요.");
+    const email = username.trim();
+    setAuthError("");
+    if (!email) {
+      setAuthError("이메일을 입력해주세요.");
+      Alert.alert("회원가입", "이메일을 입력해주세요.");
+      return;
+    }
+    if (!isEmail(email)) {
+      setAuthError("올바른 이메일 형식이 아니에요.");
+      Alert.alert("회원가입", "올바른 이메일 형식이 아니에요.");
+      return;
+    }
+    if (!nickname.trim()) {
+      setAuthError("닉네임을 입력해주세요.");
+      Alert.alert("회원가입", "닉네임을 입력해주세요.");
+      return;
+    }
+    if (password.length < 6) {
+      setAuthError("비밀번호는 6자 이상 입력해주세요.");
+      Alert.alert("회원가입", "비밀번호는 6자 이상 입력해주세요.");
       return;
     }
     if (password !== confirm) {
-      Alert.alert("회원가입", "비밀번호 확인이 일치하지 않아요.");
+      setAuthError("비밀번호가 서로 달라요.");
+      Alert.alert("회원가입", "비밀번호가 서로 달라요.");
       return;
     }
-    const nextUser = {
-      username: username.trim(),
-      password,
-      nickname: nickname.trim(),
-      email: `${username.trim()}@doodoo.app`
-    };
-    const nextUsers = [...users.filter((user) => user.username !== nextUser.username), nextUser];
-    setUsers(nextUsers);
-    await saveStoredJson("users", nextUsers);
-    const nextSession = { ...nextUser, loginType: "email" };
-    setSession(nextSession);
-    await saveStoredJson("session", nextSession);
-    setScreen("main");
+
+    setIsAuthLoading(true);
+    try {
+      const result = await signUpWithEmail({ email, password, nickname });
+      if (result.needsEmailConfirmation) {
+        Alert.alert("이메일 인증 필요", "회원가입은 완료됐어요. 메일함에서 인증을 완료한 뒤 로그인해주세요.");
+        setScreen("login");
+        return;
+      }
+
+      setAuthSession(result.authSession);
+      setUser(result.user);
+      setSession(result.appSession);
+      const remoteFields = normalizeFields(await loadCategories(result.user?.id, defaultFields));
+      const remoteTasks = await loadTasks(result.user?.id);
+      const normalizedRemoteTasks = normalizeTasks(remoteTasks || [], remoteFields);
+      const syncedRemoteTasks = notifications
+        ? await resyncTaskNotifications(normalizedRemoteTasks)
+        : normalizedRemoteTasks;
+      setFields(remoteFields);
+      setTasks(normalizeTasks(syncedRemoteTasks, remoteFields));
+      await saveStoredJson("session", result.appSession);
+      if (result.profileError) {
+        Alert.alert("프로필 안내", "회원가입은 성공했지만 프로필 저장 확인이 필요해요. Supabase profiles RLS 정책을 확인해주세요.");
+      }
+      setScreen("main");
+    } catch (error) {
+      const message = getAuthErrorMessage(error);
+      setAuthError(message);
+      Alert.alert("회원가입 실패", message);
+    } finally {
+      setIsAuthLoading(false);
+    }
   };
 
   const logout = () => {
@@ -245,15 +448,25 @@ export default function App() {
       {
         text: "로그아웃",
         onPress: async () => {
+          setIsAuthLoading(true);
+          try {
+            await cancelAllTaskNotifications();
+            await signOutFromSupabase();
+          } catch (error) {
+            Alert.alert("로그아웃 안내", getAuthErrorMessage(error));
+          }
           await removeStoredItem("session");
+          setAuthSession(null);
+          setUser(null);
           setSession(null);
+          setIsAuthLoading(false);
           setScreen("login");
         }
       }
     ]);
   };
 
-  const saveTask = (taskInput) => {
+  const saveTask = async (taskInput) => {
     const field = fields.find((item) => item.id === taskInput.fieldId);
     const now = new Date().toISOString();
     const nextTaskInput = {
@@ -262,20 +475,60 @@ export default function App() {
       priorityLabel: priorityCopy[taskInput.priority],
       isCompleted: editingTask ? Boolean(editingTask.isCompleted ?? editingTask.done) : false
     };
-    if (editingTask) {
-      setTasks((prev) => prev.map((task) => (task.id === editingTask.id ? normalizeTaskRecord({ ...task, ...nextTaskInput, updatedAt: now }, fields) : task)));
-      setDetailTaskId(editingTask.id);
-      setSelectedDate(taskInput.date);
-    } else {
-      setTasks((prev) => [normalizeTaskRecord({ ...nextTaskInput, id: makeId("task"), done: false, isCompleted: false, createdAt: now, updatedAt: now }, fields), ...prev]);
-      setSelectedDate(taskInput.date);
+    let notificationIdToRollback = null;
+    try {
+      if (editingTask) {
+        const nextTask = normalizeTaskRecord({ ...editingTask, ...nextTaskInput, updatedAt: now }, fields);
+        const taskWithNotification = notifications
+          ? await prepareTaskNotification(nextTask, editingTask, { showPermissionAlert: true, showPastAlert: true })
+          : { ...nextTask, notificationId: null };
+        if (!notifications && editingTask.notificationId) await cancelTaskNotification(editingTask.notificationId);
+        notificationIdToRollback = taskWithNotification.notificationId;
+        const savedTask = await updateTask(taskWithNotification, user?.id);
+        const normalizedSavedTask = normalizeTaskRecord(savedTask, fields);
+        setTasks((prev) => prev.map((task) => (task.id === editingTask.id ? normalizedSavedTask : task)));
+        setDetailTaskId(normalizedSavedTask.id);
+        setSelectedDate(taskInput.date);
+      } else {
+        const nextTask = normalizeTaskRecord({ ...nextTaskInput, id: makeId("task"), done: false, isCompleted: false, createdAt: now, updatedAt: now }, fields);
+        const taskWithNotification = notifications
+          ? await prepareTaskNotification(nextTask, null, { showPermissionAlert: true, showPastAlert: true })
+          : { ...nextTask, notificationId: null };
+        notificationIdToRollback = taskWithNotification.notificationId;
+        const savedTask = await createTask(taskWithNotification, user?.id);
+        setTasks((prev) => [normalizeTaskRecord(savedTask, fields), ...prev]);
+        setSelectedDate(taskInput.date);
+      }
+      setEditingTask(null);
+      setTaskSheetMode(null);
+    } catch (error) {
+      await cancelTaskNotification(notificationIdToRollback);
+      Alert.alert("저장 실패", error.message || "할 일을 저장하지 못했어요. 네트워크 연결을 확인해주세요.");
     }
-    setEditingTask(null);
-    setTaskSheetMode(null);
   };
 
-  const toggleTask = (id, done) => {
-    setTasks((prev) => prev.map((task) => (task.id === id ? { ...task, done, isCompleted: done, updatedAt: new Date().toISOString() } : task)));
+  const toggleTask = async (id, done) => {
+    const previousTasks = tasks;
+    const updatedAt = new Date().toISOString();
+    const currentTask = tasks.find((task) => task.id === id);
+    if (!currentTask) return;
+
+    try {
+      const nextBaseTask = normalizeTaskRecord({ ...currentTask, done, isCompleted: done, updatedAt }, fields);
+      const nextTask = notifications
+        ? await prepareTaskNotification(nextBaseTask, currentTask, { showPermissionAlert: false, showPastAlert: false })
+        : { ...nextBaseTask, notificationId: null };
+      if (!notifications && currentTask.notificationId) await cancelTaskNotification(currentTask.notificationId);
+
+      setTasks((prev) => prev.map((task) => (task.id === id ? nextTask : task)));
+      if (user?.id) {
+        const savedTask = await updateTask(nextTask, user.id);
+        setTasks((prev) => prev.map((task) => (task.id === id ? normalizeTaskRecord(savedTask, fields) : task)));
+      }
+    } catch (error) {
+      setTasks(previousTasks);
+      Alert.alert("저장 실패", error.message || "완료 상태를 저장하지 못했어요. 네트워크 연결을 확인해주세요.");
+    }
   };
 
   const deleteTask = (id) => {
@@ -284,48 +537,122 @@ export default function App() {
       {
         text: "삭제",
         style: "destructive",
-        onPress: () => {
+        onPress: async () => {
+          const previousTasks = tasks;
+          const targetTask = tasks.find((task) => task.id === id);
           setTasks((prev) => prev.filter((task) => task.id !== id));
           setDetailTaskId(null);
+          try {
+            await cancelTaskNotification(targetTask?.notificationId);
+            await deleteTaskById(id, user?.id);
+          } catch (error) {
+            setTasks(previousTasks);
+            Alert.alert("삭제 실패", error.message || "할 일을 삭제하지 못했어요. 네트워크 연결을 확인해주세요.");
+          }
         }
       }
     ]);
   };
 
-  const upsertField = (fieldInput) => {
-    if (fieldInput.id) {
-      setFields((prev) => prev.map((field) => (field.id === fieldInput.id ? fieldInput : field)));
-      setTasks((prev) => prev.map((task) => (
-        task.fieldId === fieldInput.id
-          ? { ...task, category: fieldInput.name, updatedAt: new Date().toISOString() }
-          : task
-      )));
-    } else {
-      setFields((prev) => [...prev, { ...fieldInput, id: makeId("field") }]);
+  const upsertField = async (fieldInput) => {
+    const normalizedName = fieldInput.name.trim();
+    const duplicate = fields.some((field) => field.id !== fieldInput.id && field.name === normalizedName);
+    if (duplicate) {
+      Alert.alert("분야 안내", "같은 이름의 분야가 이미 있어요.");
+      return;
     }
-    setFieldSheet(null);
+
+    try {
+      if (fieldInput.id) {
+        const previousField = fields.find((field) => field.id === fieldInput.id);
+        const nextField = { ...previousField, ...fieldInput, name: normalizedName, sortOrder: previousField?.sortOrder ?? fields.findIndex((field) => field.id === fieldInput.id) };
+        const savedField = await updateCategory(nextField, previousField, user?.id);
+        setFields((prev) => prev.map((field) => (field.id === fieldInput.id ? savedField : field)));
+        setTasks((prev) => prev.map((task) => (
+          task.fieldId === fieldInput.id || task.category === previousField?.name
+            ? { ...task, fieldId: savedField.id, category: savedField.name, updatedAt: new Date().toISOString() }
+            : task
+        )));
+        setFieldSheet(null);
+        return savedField;
+      } else {
+        const nextField = { ...fieldInput, name: normalizedName, id: makeId("field"), sortOrder: fields.length };
+        const savedField = await createCategory(nextField, user?.id, fields.length);
+        setFields((prev) => [...prev, savedField]);
+        setFieldSheet(null);
+        return savedField;
+      }
+    } catch (error) {
+      Alert.alert("분야 저장 실패", error.message || "분야를 저장하지 못했어요. 네트워크 연결을 확인해주세요.");
+      return null;
+    }
   };
 
   const deleteField = (fieldId) => {
+    const targetField = fields.find((field) => field.id === fieldId);
+    if (!targetField) return;
     const used = tasks.some((task) => task.fieldId === fieldId);
-    Alert.alert("분야 삭제", used ? "이 분야를 쓰는 할 일이 있어요. 삭제하면 해당 할 일의 분야가 미지정으로 바뀝니다." : "분야를 삭제할까요?", [
+    Alert.alert("분야 삭제", used ? "이 분야를 사용 중인 할 일은 ‘미지정’으로 변경됩니다." : "이 분야를 삭제하시겠습니까?", [
       { text: "취소" },
       {
         text: "삭제",
         style: "destructive",
-        onPress: () => {
+        onPress: async () => {
+          const previousFields = fields;
+          const previousTasks = tasks;
           setFields((prev) => prev.filter((field) => field.id !== fieldId));
-          setTasks((prev) => prev.map((task) => (task.fieldId === fieldId ? { ...task, fieldId: "", category: "미지정", updatedAt: new Date().toISOString() } : task)));
+          setTasks((prev) => prev.map((task) => (
+            task.fieldId === fieldId || task.category === targetField.name
+              ? { ...task, fieldId: "", category: "미지정", updatedAt: new Date().toISOString() }
+              : task
+          )));
+          try {
+            await deleteCategoryById(targetField, user?.id);
+          } catch (error) {
+            setFields(previousFields);
+            setTasks(previousTasks);
+            Alert.alert("분야 삭제 실패", error.message || "분야를 삭제하지 못했어요. 네트워크 연결을 확인해주세요.");
+          }
         }
       }
     ]);
   };
 
+  const reorderFields = async (nextFields) => {
+    const previousFields = fields;
+    const orderedFields = nextFields.map((field, index) => ({
+      ...field,
+      sortOrder: index,
+      updatedAt: new Date().toISOString()
+    }));
+
+    setFields(orderedFields);
+    try {
+      const savedFields = await updateCategoryOrder(orderedFields, user?.id);
+      setFields(normalizeFields(savedFields));
+    } catch (error) {
+      setFields(previousFields);
+      Alert.alert("순서 저장 실패", error.message || "분야 순서를 저장하지 못했어요. 네트워크 연결을 확인해주세요.");
+    }
+  };
+
   const changeNotifications = (nextValue) => {
     if (!nextValue) {
-      Alert.alert("알림 끄기", "알림을 끄시겠습니까? 실제 푸시 알림은 아직 연결하지 않았어요.", [
+      Alert.alert("알림 끄기", "알림을 끄면 예약된 할 일 알림도 함께 취소돼요.", [
         { text: "취소" },
-        { text: "끄기", onPress: () => setNotifications(false) }
+        {
+          text: "끄기",
+          onPress: async () => {
+            await cancelAllTaskNotifications();
+            const now = new Date().toISOString();
+            const nextTasks = tasks.map((task) => ({ ...task, notificationId: null, updatedAt: now }));
+            setTasks(nextTasks);
+            if (user?.id) {
+              await Promise.all(nextTasks.map((task) => updateTask(task, user.id)));
+            }
+            setNotifications(false);
+          }
+        }
       ]);
       return;
     }
@@ -335,8 +662,8 @@ export default function App() {
   return (
     <SafeAreaView style={styles.app}>
       <StatusBar style="dark" />
-      {screen === "login" && <LoginScreen onLogin={login} onSignup={() => setScreen("signup")} />}
-      {screen === "signup" && <SignupScreen onBack={() => setScreen("login")} onSignup={signup} />}
+      {screen === "login" && <LoginScreen onLogin={login} onGoogleLogin={loginWithGoogle} onSignup={() => { setAuthError(""); setScreen("signup"); }} authError={authError} loading={isAuthLoading} />}
+      {screen === "signup" && <SignupScreen onBack={() => { setAuthError(""); setScreen("login"); }} onSignup={signup} authError={authError} loading={isAuthLoading} />}
       {screen === "main" && (
         <MainScreen
           tasks={tasks}
@@ -373,6 +700,7 @@ export default function App() {
           onAdd={() => setFieldSheet({ mode: "add" })}
           onEdit={(field) => setFieldSheet({ mode: "edit", field })}
           onDelete={deleteField}
+          onReorder={reorderFields}
         />
       )}
       <TaskSheet
@@ -385,7 +713,7 @@ export default function App() {
           setTaskSheetMode(null);
           setEditingTask(null);
         }}
-        onAddField={() => setFieldSheet({ mode: "add" })}
+        onAddField={upsertField}
         onSubmit={saveTask}
       />
       <TaskDetailSheet
@@ -421,14 +749,16 @@ function normalizeTaskRecord(task, fields = defaultFields) {
     priorityLabel: priorityCopy[priority],
     done,
     isCompleted: done,
-    isAllDay: Boolean(task.isAllDay),
-    startDate: task.startDate || null,
-    startTime: task.isAllDay ? null : task.startTime || null,
-    endDate: task.endDate || null,
-    endTime: task.isAllDay ? null : task.endTime || null,
-    reminderType: task.reminderType || (task.alarm ? "custom" : "none"),
-    reminderDate: task.reminderDate || null,
-    reminderTime: task.reminderType === "custom" || task.reminderTime ? task.reminderTime || null : null,
+    isAllDay: Boolean(task.isAllDay ?? task.is_all_day),
+    startDate: task.startDate || task.start_date || task.date || null,
+    startTime: (task.isAllDay ?? task.is_all_day) ? null : task.startTime || task.start_time || null,
+    endDate: task.endDate || task.end_date || task.date || null,
+    endTime: (task.isAllDay ?? task.is_all_day) ? null : task.endTime || task.end_time || null,
+    reminderType: task.reminderType || task.reminder_type || (task.alarm ? "custom" : "none"),
+    reminderDate: task.reminderDate || task.reminder_date || task.date || null,
+    reminderTime: (task.reminderType || task.reminder_type) === "custom" || task.reminderTime || task.reminder_time ? task.reminderTime || task.reminder_time || null : null,
+    notificationId: task.notificationId || task.notification_id || null,
+    sortOrder: Number.isFinite(Number(task.sortOrder ?? task.sort_order)) ? Number(task.sortOrder ?? task.sort_order) : null,
     memo: task.memo || "",
     createdAt: task.createdAt || new Date().toISOString(),
     updatedAt: task.updatedAt || task.createdAt || new Date().toISOString()
@@ -440,12 +770,18 @@ function normalizeTasks(items, fields = defaultFields) {
 }
 
 function normalizeFields(items) {
-  const cleaned = items.filter((field) => field.id !== "health" && field.name !== "건강관리");
+  const cleaned = items
+    .filter((field) => field.id !== "health" && field.name !== "건강관리")
+    .map((field, index) => ({
+      ...field,
+      sortOrder: Number.isFinite(Number(field.sortOrder)) ? Number(field.sortOrder) : index
+    }));
   const hasSchedule = cleaned.some((field) => field.id === "schedule");
-  return hasSchedule ? cleaned : [...cleaned, { id: "schedule", name: "일정", color: "#16b8c9" }];
+  const withSchedule = hasSchedule ? cleaned : [...cleaned, { id: "schedule", name: "일정", color: "#16b8c9", sortOrder: cleaned.length }];
+  return withSchedule.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
 }
 
-function LoginScreen({ onLogin, onSignup }) {
+function LoginScreen({ onLogin, onGoogleLogin, onSignup, authError, loading }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   return (
@@ -456,15 +792,17 @@ function LoginScreen({ onLogin, onSignup }) {
           <Text style={styles.brand}>DooDoo</Text>
           <Text style={styles.sub}>오늘 할 일을 관리하세요</Text>
         </View>
-        <View style={styles.socials}>
-          <SocialButton icon="G" label="Google로 계속하기" bg="#ffffff" fg={INK} onPress={() => Alert.alert("준비 중", "소셜 로그인은 나중에 연결할 예정이에요.")} />
-          <SocialButton icon="K" label="카카오로 계속하기" bg="#ffdf00" fg="#231815" onPress={() => Alert.alert("준비 중", "카카오 로그인은 나중에 연결할 예정이에요.")} />
-          <SocialButton icon="A" label="Apple로 계속하기" bg="#000000" fg="#ffffff" onPress={() => Alert.alert("준비 중", "Apple 로그인은 나중에 연결할 예정이에요.")} />
-        </View>
         <Divider label="이메일로 로그인" />
-        <Input label="아이디 *" value={username} onChangeText={setUsername} placeholder="아이디를 입력하세요" autoCapitalize="none" />
+        <Input label="이메일 *" value={username} onChangeText={setUsername} placeholder="이메일을 입력하세요" autoCapitalize="none" keyboardType="email-address" />
         <Input label="비밀번호 *" value={password} onChangeText={setPassword} placeholder="비밀번호를 입력하세요" secureTextEntry />
-        <PrimaryButton label="로그인" onPress={() => onLogin({ username, password })} disabled={!username.trim() || !password.trim()} />
+        {!!authError && <Text style={styles.authError}>{authError}</Text>}
+        <PrimaryButton label={loading ? "로그인 중..." : "로그인"} onPress={() => onLogin({ username, password })} disabled={loading || !username.trim() || !password.trim()} />
+        <Divider label="소셜 로그인" />
+        <View style={styles.socials}>
+          <SocialButton icon="G" label={loading ? "Google 연결 중..." : "Google로 계속하기"} bg="#ffffff" fg={INK} onPress={onGoogleLogin} disabled={loading} />
+          <SocialButton icon="K" label="카카오로 계속하기" bg="#ffdf00" fg="#231815" onPress={() => Alert.alert("준비 중", "카카오 로그인은 나중에 만들 예정이에요.")} />
+          <SocialButton icon="A" label="Apple로 계속하기" bg="#000000" fg="#ffffff" onPress={() => Alert.alert("준비 중", "Apple 로그인은 나중에 만들 예정이에요.")} />
+        </View>
         <View style={styles.signupBox}>
           <View>
             <Text style={styles.signupTitle}>아직 계정이 없으신가요?</Text>
@@ -477,7 +815,7 @@ function LoginScreen({ onLogin, onSignup }) {
   );
 }
 
-function SignupScreen({ onBack, onSignup }) {
+function SignupScreen({ onBack, onSignup, authError, loading }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -486,14 +824,15 @@ function SignupScreen({ onBack, onSignup }) {
     <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.screen}>
       <TopBar title="회원가입" onBack={onBack} />
       <ScrollView showsVerticalScrollIndicator={false}>
-        <Input label="아이디 *" value={username} onChangeText={setUsername} placeholder="아이디를 입력하세요" autoCapitalize="none" />
-        <HelperText ok={username.length >= 3} text="아이디가 3자 이상이면 사용 가능해요" />
+        <Input label="이메일 *" value={username} onChangeText={setUsername} placeholder="이메일을 입력하세요" autoCapitalize="none" keyboardType="email-address" />
+        <HelperText ok={isEmail(username)} text="이메일 형식으로 입력해주세요" />
         <Input label="비밀번호 *" value={password} onChangeText={setPassword} placeholder="비밀번호를 입력하세요" secureTextEntry />
-        <HelperText ok={password.length >= 4} text="비밀번호가 4자 이상이면 사용 가능해요" />
+        <HelperText ok={password.length >= 6} text="비밀번호는 6자 이상 입력해주세요" />
         <Input label="비밀번호 확인 *" value={confirm} onChangeText={setConfirm} placeholder="비밀번호를 다시 입력하세요" secureTextEntry />
         <HelperText ok={!!confirm && password === confirm} text={confirm ? "일치해요" : "비밀번호 확인을 입력해주세요"} />
         <Input label={`닉네임 * ${nickname.length}/12`} value={nickname} onChangeText={(value) => setNickname(value.slice(0, 12))} placeholder="닉네임을 입력하세요" />
-        <PrimaryButton label="회원가입" onPress={() => onSignup({ username, password, confirm, nickname })} />
+        {!!authError && <Text style={styles.authError}>{authError}</Text>}
+        <PrimaryButton label={loading ? "가입 중..." : "회원가입"} onPress={() => onSignup({ username, password, confirm, nickname })} disabled={loading} />
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -539,6 +878,9 @@ function compareTasks(a, b) {
   const bHasTime = Boolean(b.startTime);
   if (aHasTime && bHasTime && a.startTime !== b.startTime) return a.startTime.localeCompare(b.startTime);
   if (aHasTime !== bHasTime) return aHasTime ? -1 : 1;
+  const aCreated = a.createdAt || "";
+  const bCreated = b.createdAt || "";
+  if (aCreated !== bCreated) return aCreated.localeCompare(bCreated);
   return a.title.localeCompare(b.title);
 }
 
@@ -670,42 +1012,87 @@ function Calendar({ mode, selectedDate, tasks, onSelect }) {
 }
 
 function TaskSheet({ visible, mode, initialTask, selectedDate, fields, onClose, onAddField, onSubmit }) {
+  const sheetScrollRef = useRef(null);
+  const memoFocusedRef = useRef(false);
+  const sheetDrag = useBottomSheetDrag(onClose, visible);
+  const baseDate = selectedDate || todayKey();
   const [title, setTitle] = useState("");
-  const [date, setDate] = useState(selectedDate);
+  const [date, setDate] = useState(baseDate);
   const [fieldId, setFieldId] = useState(fields[0]?.id || "");
   const [priority, setPriority] = useState(null);
   const [hasTime, setHasTime] = useState(false);
   const [isAllDay, setIsAllDay] = useState(false);
-  const [startDate, setStartDate] = useState(selectedDate);
+  const [startDate, setStartDate] = useState(baseDate);
   const [startTime, setStartTime] = useState("09:00");
-  const [endDate, setEndDate] = useState(selectedDate);
+  const [endDate, setEndDate] = useState(baseDate);
   const [endTime, setEndTime] = useState("10:00");
   const [reminderType, setReminderType] = useState("none");
-  const [reminderDate, setReminderDate] = useState(selectedDate);
+  const [reminderDate, setReminderDate] = useState(baseDate);
   const [reminderTime, setReminderTime] = useState("09:00");
   const [memo, setMemo] = useState("");
   const [fieldScroll, setFieldScroll] = useState({ x: 0, content: 1, width: 1 });
   const [timePicker, setTimePicker] = useState(null);
   const [datePicker, setDatePicker] = useState(null);
+  const [quickFieldOpen, setQuickFieldOpen] = useState(false);
 
   useEffect(() => {
     if (!visible) return;
     const initialHasTime = Boolean(initialTask && hasStructuredTime(initialTask));
     setTitle(initialTask?.title || "");
-    setDate(initialTask?.date || selectedDate);
+    setDate(initialTask?.date || baseDate);
     setFieldId(initialTask?.fieldId || fields[0]?.id || "");
     setPriority(initialTask?.priority || null);
     setHasTime(initialHasTime);
     setIsAllDay(Boolean(initialTask?.isAllDay));
-    setStartDate(initialTask?.startDate || initialTask?.date || selectedDate);
+    setStartDate(initialTask?.startDate || initialTask?.date || baseDate);
     setStartTime(initialTask?.startTime || "09:00");
-    setEndDate(initialTask?.endDate || initialTask?.date || selectedDate);
+    setEndDate(initialTask?.endDate || initialTask?.date || baseDate);
     setEndTime(initialTask?.endTime || "10:00");
     setReminderType(initialTask?.reminderType || "none");
-    setReminderDate(initialTask?.reminderDate || initialTask?.date || selectedDate);
+    setReminderDate(initialTask?.reminderDate || initialTask?.date || baseDate);
     setReminderTime(initialTask?.reminderTime || "09:00");
     setMemo(initialTask?.memo || "");
-  }, [visible, initialTask, selectedDate, fields]);
+  }, [visible, initialTask, baseDate]);
+
+  useEffect(() => {
+    if (!visible) return;
+    if (!fieldId && fields[0]?.id) setFieldId(fields[0].id);
+    if (fieldId && !fields.some((field) => field.id === fieldId) && fields[0]?.id) setFieldId(fields[0].id);
+  }, [visible, fields, fieldId]);
+
+  const scrollToMemoInput = useCallback((delay = 260) => {
+    setTimeout(() => {
+      sheetScrollRef.current?.scrollToEnd({ animated: true });
+    }, delay);
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    activeMultilineFocusHandler = () => {
+      memoFocusedRef.current = true;
+      scrollToMemoInput(260);
+      scrollToMemoInput(520);
+    };
+    activeMultilineBlurHandler = () => {
+      memoFocusedRef.current = false;
+    };
+    return () => {
+      activeMultilineFocusHandler = null;
+      activeMultilineBlurHandler = null;
+      memoFocusedRef.current = false;
+    };
+  }, [visible, scrollToMemoInput]);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const subscription = Keyboard.addListener(showEvent, () => {
+      if (memoFocusedRef.current) {
+        scrollToMemoInput(80);
+      }
+    });
+    return () => subscription.remove();
+  }, [visible, scrollToMemoInput]);
 
   const valid = title.trim() && date && fieldId && priority;
   const relativeReminderNeedsTime = reminderOptions.find((item) => item.type === reminderType)?.needsStartTime;
@@ -781,13 +1168,19 @@ function TaskSheet({ visible, mode, initialTask, selectedDate, fields, onClose, 
     <>
       <Modal transparent visible={visible} animationType="slide" onRequestClose={onClose}>
         <View style={styles.backdrop}>
-          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.sheet}>
-          <SheetHandle />
+          <Animated.View style={[styles.sheetAnimatedWrap, { transform: [{ translateY: sheetDrag.translateY }] }]}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.sheet}>
+          <SheetHandle panHandlers={sheetDrag.panHandlers} />
           <View style={styles.sheetTitleRow}>
             <Text style={styles.sheetTitle}>{mode === "edit" ? "할 일 수정" : "할 일 추가"}</Text>
             <CircleButton text="×" onPress={onClose} />
           </View>
-          <ScrollView showsVerticalScrollIndicator={false}>
+          <ScrollView
+            ref={sheetScrollRef}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.sheetScrollContent}
+          >
             <Input label="할 일 *" value={title} onChangeText={setTitle} placeholder="할 일을 입력하세요" />
             <FieldLabel label="날짜 *" />
             <StepperBox text={prettyDate(date)} onLeft={() => setDate(shiftDate(date, -1))} onRight={() => setDate(shiftDate(date, 1))} />
@@ -808,7 +1201,10 @@ function TaskSheet({ visible, mode, initialTask, selectedDate, fields, onClose, 
               scrollEventThrottle={16}
             >
               {fields.map((field) => <Chip key={field.id} field={field} active={fieldId === field.id} onPress={() => setFieldId(field.id)} />)}
-              <Pressable style={styles.addChip} onPress={onAddField}><Text style={styles.addChipText}>+ 분야</Text></Pressable>
+              <Pressable style={styles.addChip} onPress={() => {
+                Keyboard.dismiss();
+                setQuickFieldOpen(true);
+              }}><Text style={styles.addChipText}>+ 분야</Text></Pressable>
             </ScrollView>
             {fieldScroll.content > fieldScroll.width && (
               <View style={styles.scrollHintTrack}>
@@ -828,8 +1224,8 @@ function TaskSheet({ visible, mode, initialTask, selectedDate, fields, onClose, 
             {!hasTime ? (
               <Pressable style={styles.optionalButton} onPress={() => {
                 setHasTime(true);
-                setStartDate(date);
-                setEndDate(date);
+                setStartDate(date || baseDate);
+                setEndDate(date || baseDate);
               }}>
                 <Text style={styles.optionalButtonText}>시간 추가</Text>
               </Pressable>
@@ -888,12 +1284,25 @@ function TaskSheet({ visible, mode, initialTask, selectedDate, fields, onClose, 
             <PrimaryButton label={mode === "edit" ? "수정하기" : "추가하기"} disabled={!valid} onPress={submit} />
           </ScrollView>
           </KeyboardAvoidingView>
+          </Animated.View>
           {!!timePicker && (
             <TimePickerInlineOverlay
               title={timePicker?.label || "시간 선택"}
               value={timePicker?.value || "09:00"}
               onCancel={() => setTimePicker(null)}
               onConfirm={applyPickedTime}
+            />
+          )}
+          {quickFieldOpen && (
+            <QuickFieldSheet
+              onClose={() => setQuickFieldOpen(false)}
+              onSubmit={async (fieldInput) => {
+                const savedField = await onAddField?.(fieldInput);
+                if (savedField?.id) {
+                  setFieldId(savedField.id);
+                  setQuickFieldOpen(false);
+                }
+              }}
             />
           )}
         </View>
@@ -1054,7 +1463,7 @@ function SettingsScreen({ session, fields, notifications, onChangeNotifications,
           <View>
             <Text style={styles.accountName}>{session?.nickname || "DooDoo User"}</Text>
             <Text style={styles.accountEmail}>{session?.email || "user@doodoo.app"}</Text>
-            <Text style={styles.loginType}>● {session?.loginType || "email"}로 로그인</Text>
+            <Text style={styles.loginType}>● {loginProviderLabel(session?.loginType || session?.provider)}로 로그인</Text>
           </View>
         </View>
         <MenuGroup>
@@ -1081,19 +1490,47 @@ function SettingsScreen({ session, fields, notifications, onChangeNotifications,
   );
 }
 
-function FieldsScreen({ fields, tasks, onBack, onAdd, onEdit, onDelete }) {
+function FieldsScreen({ fields, tasks, onBack, onAdd, onEdit, onDelete, onReorder }) {
+  const [orderedFields, setOrderedFields] = useState(fields);
+  const [draggingFieldId, setDraggingFieldId] = useState(null);
+
+  useEffect(() => {
+    setOrderedFields(fields);
+  }, [fields]);
+
+  const finishDrag = useCallback((fieldId, dragY) => {
+    setDraggingFieldId(null);
+    const fromIndex = orderedFields.findIndex((field) => field.id === fieldId);
+    if (fromIndex < 0) return;
+    const offset = Math.round(dragY / FIELD_ROW_HEIGHT);
+    const toIndex = Math.max(0, Math.min(orderedFields.length - 1, fromIndex + offset));
+    if (fromIndex === toIndex) return;
+
+    const nextFields = [...orderedFields];
+    const [movingField] = nextFields.splice(fromIndex, 1);
+    nextFields.splice(toIndex, 0, movingField);
+    const ordered = nextFields.map((field, index) => ({ ...field, sortOrder: index }));
+    setOrderedFields(ordered);
+    onReorder?.(ordered);
+  }, [onReorder, orderedFields]);
+
   return (
     <View style={styles.screen}>
       <TopBar title="분야 관리" onBack={onBack} />
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.settingsScroll}>
-        {fields.map((field) => (
-          <View key={field.id} style={styles.fieldRow}>
-            <View style={[styles.fieldSwatch, { backgroundColor: field.color }]} />
-            <Text style={styles.fieldName}>{field.name}</Text>
-            <Text style={styles.fieldCount}>{tasks.filter((task) => task.fieldId === field.id).length}개</Text>
-            <Pressable onPress={() => onEdit(field)}><Text style={styles.more}>수정</Text></Pressable>
-            <Pressable onPress={() => onDelete(field.id)}><Text style={styles.deleteText}>삭제</Text></Pressable>
-          </View>
+      <ScrollView scrollEnabled={!draggingFieldId} showsVerticalScrollIndicator={false} contentContainerStyle={styles.fieldsScroll}>
+        {orderedFields.map((field, index) => (
+          <DraggableFieldRow
+            key={field.id}
+            field={field}
+            index={index}
+            itemCount={orderedFields.length}
+            count={tasks.filter((task) => task.fieldId === field.id || task.category === field.name).length}
+            dragging={draggingFieldId === field.id}
+            onDragStart={() => setDraggingFieldId(field.id)}
+            onDragEnd={(dragY) => finishDrag(field.id, dragY)}
+            onEdit={() => onEdit(field)}
+            onDelete={() => onDelete(field.id)}
+          />
         ))}
         <PrimaryButton label="새 분야 추가" onPress={onAdd} />
       </ScrollView>
@@ -1101,7 +1538,83 @@ function FieldsScreen({ fields, tasks, onBack, onAdd, onEdit, onDelete }) {
   );
 }
 
+function DraggableFieldRow({ field, index, itemCount, count, dragging, onDragStart, onDragEnd, onEdit, onDelete }) {
+  const dragY = useRef(new Animated.Value(0)).current;
+  const latestDragY = useRef(0);
+  const hasMovedRef = useRef(false);
+  const suppressOpenRef = useRef(false);
+  const lastIndexRef = useRef(index);
+  const lastIndexHapticAtRef = useRef(0);
+
+  useEffect(() => {
+    if (!dragging) {
+      latestDragY.current = 0;
+      lastIndexRef.current = index;
+      lastIndexHapticAtRef.current = 0;
+      dragY.setValue(0);
+    }
+  }, [dragging, dragY, index]);
+
+  const finishDrag = useCallback((value) => {
+    dragY.setValue(0);
+    if (hasMovedRef.current) playMediumHaptic();
+    onDragEnd(value);
+  }, [dragY, onDragEnd]);
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 3 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
+    onPanResponderGrant: () => {
+      hasMovedRef.current = false;
+      latestDragY.current = 0;
+      lastIndexRef.current = index;
+      lastIndexHapticAtRef.current = 0;
+      playLightHaptic();
+      onDragStart();
+    },
+    onPanResponderMove: (_, gesture) => {
+      const nextY = Math.max(-FIELD_ROW_HEIGHT * 4, Math.min(FIELD_ROW_HEIGHT * 4, gesture.dy));
+      if (Math.abs(nextY) > 3) hasMovedRef.current = true;
+      latestDragY.current = nextY;
+      dragY.setValue(nextY);
+      const projectedIndex = Math.max(0, Math.min(itemCount - 1, index + Math.round(nextY / FIELD_ROW_HEIGHT)));
+      const now = Date.now();
+      if (projectedIndex !== lastIndexRef.current && now - lastIndexHapticAtRef.current > 90) {
+        lastIndexRef.current = projectedIndex;
+        lastIndexHapticAtRef.current = now;
+        playSelectionHaptic();
+      }
+    },
+    onPanResponderRelease: () => finishDrag(hasMovedRef.current ? latestDragY.current : 0),
+    onPanResponderTerminate: () => finishDrag(hasMovedRef.current ? latestDragY.current : 0)
+  }), [dragY, finishDrag, index, itemCount, onDragStart]);
+
+  return (
+    <Animated.View
+      style={[
+        styles.fieldRow,
+        dragging && styles.fieldRowDragging,
+        { transform: [{ translateY: dragY }] }
+      ]}
+    >
+      <View style={styles.fieldRowPressArea}>
+        <View style={[styles.fieldSwatch, { backgroundColor: field.color }]} />
+        <Text style={styles.fieldName}>{field.name}</Text>
+      </View>
+      <Text style={styles.fieldCount}>{count}개</Text>
+      <Pressable onPress={onEdit} hitSlop={8}><Text style={styles.more}>수정</Text></Pressable>
+      <Pressable onPress={onDelete} hitSlop={8}><Text style={styles.deleteText}>삭제</Text></Pressable>
+      <View {...panResponder.panHandlers} style={styles.dragHandleTouch}>
+        <Text style={styles.dragHandle}>☰</Text>
+      </View>
+    </Animated.View>
+  );
+}
+
 function FieldSheet({ visible, field, onClose, onSubmit }) {
+  const fieldScrollRef = useRef(null);
+  const fieldInputFocusedRef = useRef(false);
+  const sheetDrag = useBottomSheetDrag(onClose, visible);
   const [name, setName] = useState("");
   const [color, setColor] = useState(fieldColors[0]);
 
@@ -1111,24 +1624,146 @@ function FieldSheet({ visible, field, onClose, onSubmit }) {
     setColor(field?.color || fieldColors[0]);
   }, [visible, field]);
 
+  const scrollToInput = useCallback((delay = 260) => {
+    setTimeout(() => {
+      fieldScrollRef.current?.scrollToEnd({ animated: true });
+    }, delay);
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const subscription = Keyboard.addListener(showEvent, () => {
+      if (fieldInputFocusedRef.current) scrollToInput(80);
+    });
+    return () => {
+      fieldInputFocusedRef.current = false;
+      subscription.remove();
+    };
+  }, [visible, scrollToInput]);
+
   return (
     <Modal transparent visible={visible} animationType="slide" onRequestClose={onClose}>
       <View style={styles.backdrop}>
-        <View style={styles.fieldSheet}>
-          <SheetHandle />
-          <View style={styles.sheetTitleRow}>
-            <Text style={styles.sheetTitle}>{field ? "분야 수정" : "분야 추가"}</Text>
-            <CircleButton text="×" onPress={onClose} />
-          </View>
-          <Input label="분야 이름 *" value={name} onChangeText={setName} placeholder="예: 독서, 여행..." />
-          <FieldLabel label="색상 *" />
-          <View style={styles.colorGrid}>
-            {fieldColors.map((item) => <Pressable key={item} style={[styles.colorDot, { backgroundColor: item }, color === item && styles.colorSelected]} onPress={() => setColor(item)} />)}
-          </View>
-          <PrimaryButton label={field ? "수정하기" : "추가하기"} disabled={!name.trim()} onPress={() => onSubmit({ id: field?.id, name: name.trim(), color })} />
-        </View>
+        <Animated.View style={[styles.sheetAnimatedWrap, { transform: [{ translateY: sheetDrag.translateY }] }]}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.fieldSheet}>
+            <SheetHandle panHandlers={sheetDrag.panHandlers} />
+            <ScrollView
+              ref={fieldScrollRef}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={styles.fieldSheetScrollContent}
+            >
+              <View style={styles.sheetTitleRow}>
+                <Text style={styles.sheetTitle}>{field ? "분야 수정" : "분야 추가"}</Text>
+                <CircleButton text="×" onPress={onClose} />
+              </View>
+              <Input
+                label="분야 이름 *"
+                value={name}
+                onChangeText={setName}
+                placeholder="예: 독서, 여행..."
+                onFocus={() => {
+                  fieldInputFocusedRef.current = true;
+                  scrollToInput(260);
+                  scrollToInput(520);
+                }}
+                onBlur={() => {
+                  fieldInputFocusedRef.current = false;
+                }}
+              />
+              <FieldLabel label="색상 *" />
+              <View style={styles.colorGrid}>
+                {fieldColors.map((item) => <Pressable key={item} style={[styles.colorDot, { backgroundColor: item }, color === item && styles.colorSelected]} onPress={() => setColor(item)} />)}
+              </View>
+              <PrimaryButton label={field ? "수정하기" : "추가하기"} disabled={!name.trim()} onPress={() => onSubmit({ id: field?.id, name: name.trim(), color })} />
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </Animated.View>
       </View>
     </Modal>
+  );
+}
+
+function QuickFieldSheet({ onClose, onSubmit }) {
+  const fieldScrollRef = useRef(null);
+  const fieldInputFocusedRef = useRef(false);
+  const sheetDrag = useBottomSheetDrag(onClose, true);
+  const [name, setName] = useState("");
+  const [color, setColor] = useState(fieldColors[0]);
+  const [saving, setSaving] = useState(false);
+
+  const scrollToInput = useCallback((delay = 260) => {
+    setTimeout(() => {
+      fieldScrollRef.current?.scrollToEnd({ animated: true });
+    }, delay);
+  }, []);
+
+  useEffect(() => {
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const subscription = Keyboard.addListener(showEvent, () => {
+      if (fieldInputFocusedRef.current) scrollToInput(80);
+    });
+    return () => {
+      fieldInputFocusedRef.current = false;
+      subscription.remove();
+    };
+  }, [scrollToInput]);
+
+  const submit = async () => {
+    if (!name.trim() || saving) return;
+    setSaving(true);
+    try {
+      await onSubmit?.({ name: name.trim(), color });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <View style={styles.timeInlineOverlay}>
+      <Animated.View style={[styles.sheetAnimatedWrap, { transform: [{ translateY: sheetDrag.translateY }] }]}>
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.fieldSheet}>
+          <SheetHandle panHandlers={sheetDrag.panHandlers} />
+          <ScrollView
+            ref={fieldScrollRef}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.fieldSheetScrollContent}
+          >
+            <View style={styles.sheetTitleRow}>
+              <Text style={styles.sheetTitle}>분야 추가</Text>
+              <CircleButton text="×" onPress={onClose} />
+            </View>
+            <Input
+              label="분야 이름 *"
+              value={name}
+              onChangeText={setName}
+              placeholder="예: 독서, 여행..."
+              onFocus={() => {
+                fieldInputFocusedRef.current = true;
+                scrollToInput(260);
+                scrollToInput(520);
+              }}
+              onBlur={() => {
+                fieldInputFocusedRef.current = false;
+              }}
+            />
+            <FieldLabel label="색상 *" />
+            <View style={styles.colorGrid}>
+              {fieldColors.map((item) => (
+                <Pressable
+                  key={item}
+                  style={[styles.colorDot, { backgroundColor: item }, color === item && styles.colorSelected]}
+                  onPress={() => setColor(item)}
+                />
+              ))}
+            </View>
+            <PrimaryButton label={saving ? "저장 중..." : "추가하기"} disabled={!name.trim() || saving} onPress={submit} />
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </Animated.View>
+    </View>
   );
 }
 
@@ -1141,7 +1776,7 @@ function PrioritySection({ priority, tasks, fields, onOpenTask, onToggleTask }) 
         <Text style={styles.priorityDesc}>{priorityCopy[priority]}</Text>
         <Text style={styles.priorityCount}>{tasks.filter((task) => task.done).length}/{tasks.length || 1}</Text>
       </View>
-      {tasks.length === 0 && <Text style={styles.emptyText}>해당 우선순위의 할 일이 없어요.</Text>}
+      {tasks.length === 0 && <Text style={styles.emptyText}>할 일이 없어요</Text>}
       {tasks.map((task) => <TaskCard key={task.id} task={task} field={fields.find((field) => field.id === task.fieldId)} onOpenTask={onOpenTask} onToggleTask={onToggleTask} />)}
     </View>
   );
@@ -1150,19 +1785,20 @@ function PrioritySection({ priority, tasks, fields, onOpenTask, onToggleTask }) 
 function TaskCard({ task, field, onOpenTask, onToggleTask }) {
   const timeLabel = formatTaskTime(task);
   const reminderLabel = formatReminder(task);
+  const reminderNoneLabel = "\uC54C\uB9BC \uC5C6\uC74C";
   return (
     <Pressable style={styles.taskCard} onPress={() => onOpenTask(task.id)}>
       <Pressable style={[styles.check, task.done && styles.checkDone]} onPress={() => onToggleTask(task.id, !task.done)}>
-        <Text style={styles.checkText}>{task.done ? "✓" : ""}</Text>
+        <Text style={styles.checkText}>{task.done ? "\u2713" : ""}</Text>
       </Pressable>
       <View style={styles.taskMid}>
         <Text numberOfLines={2} style={[styles.taskTitle, task.done && styles.doneTitle]}>{task.title}</Text>
         <View style={styles.metaRow}>
-          {!!timeLabel && <Text style={styles.meta}>시간 {timeLabel}</Text>}
-          {reminderLabel !== "알림 없음" && <Text style={styles.meta}>알림 {reminderLabel}</Text>}
-          {!!task.memo && <Text style={styles.meta}>메모</Text>}
-          <Text style={[styles.priorityTag, { backgroundColor: `${priorityColors[task.priority]}20`, color: priorityColors[task.priority] }]}>{task.priority}순위</Text>
-          <Text style={[styles.fieldTag, { backgroundColor: `${field?.color || BLUE}22`, color: field?.color || BLUE }]}>{field?.name || "미지정"}</Text>
+          {!!task.memo && <Text style={styles.meta}>{"\uBA54\uBAA8"}</Text>}
+          <Text style={[styles.priorityTag, { backgroundColor: `${priorityColors[task.priority]}20`, color: priorityColors[task.priority] }]}>{task.priority}{"\uC21C\uC704"}</Text>
+          <Text style={[styles.fieldTag, { backgroundColor: `${field?.color || BLUE}22`, color: field?.color || BLUE }]}>{field?.name || "\uBBF8\uC9C0\uC815"}</Text>
+          {!!timeLabel && <Text style={styles.timeTag}>{timeLabel}</Text>}
+          {reminderLabel !== reminderNoneLabel && <Text style={styles.meta}>{"\uC54C\uB9BC"} {reminderLabel}</Text>}
         </View>
       </View>
       <Text style={styles.more}>...</Text>
@@ -1173,7 +1809,26 @@ function TaskCard({ task, field, onOpenTask, onToggleTask }) {
 function Input({ label, ...props }) {
   const required = label.trim().endsWith("*");
   const cleanLabel = required ? label.replace(/\s*\*$/, "") : label;
-  return <View style={styles.inputWrap}><FieldLabel label={cleanLabel} required={required} /><TextInput style={[styles.input, props.multiline && styles.textArea]} placeholderTextColor="#c2cada" {...props} /></View>;
+  const handleFocus = (event) => {
+    props.onFocus?.(event);
+    if (props.multiline) activeMultilineFocusHandler?.();
+  };
+  const handleBlur = (event) => {
+    props.onBlur?.(event);
+    if (props.multiline) activeMultilineBlurHandler?.();
+  };
+  return (
+    <View style={styles.inputWrap}>
+      <FieldLabel label={cleanLabel} required={required} />
+      <TextInput
+        style={[styles.input, props.multiline && styles.textArea]}
+        placeholderTextColor="#c2cada"
+        {...props}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
+      />
+    </View>
+  );
 }
 
 function OptionalInput({ label, value, setValue, placeholder, multiline }) {
@@ -1195,8 +1850,8 @@ function PrimaryButton({ label, onPress, disabled }) {
   return <Pressable style={[styles.primary, disabled && styles.primaryDisabled]} onPress={onPress} disabled={disabled}><Text style={styles.primaryText}>{label}</Text></Pressable>;
 }
 
-function SocialButton({ icon, label, bg, fg, onPress }) {
-  return <Pressable style={[styles.socialButton, { backgroundColor: bg }]} onPress={onPress}><Text style={[styles.socialIcon, { color: fg }]}>{icon}</Text><Text style={[styles.socialText, { color: fg }]}>{label}</Text></Pressable>;
+function SocialButton({ icon, label, bg, fg, onPress, disabled }) {
+  return <Pressable disabled={disabled} style={[styles.socialButton, { backgroundColor: bg }, disabled && styles.socialButtonDisabled]} onPress={onPress}><Text style={[styles.socialIcon, { color: fg }]}>{icon}</Text><Text style={[styles.socialText, { color: fg }]}>{label}</Text></Pressable>;
 }
 
 function Divider({ label }) {
@@ -1220,8 +1875,66 @@ function TopBar({ title, onBack }) {
   return <View style={styles.topBar}><CircleButton text="‹" onPress={onBack} /><Text style={styles.topTitle}>{title}</Text><View style={styles.topSpacer} /></View>;
 }
 
-function SheetHandle() {
-  return <View style={styles.handle} />;
+function useBottomSheetDrag(onClose, visible = true) {
+  const translateY = useRef(new Animated.Value(0)).current;
+  const closingRef = useRef(false);
+
+  useEffect(() => {
+    if (!visible) return;
+    closingRef.current = false;
+    translateY.setValue(0);
+  }, [visible, translateY]);
+
+  const snapBack = useCallback(() => {
+    Animated.spring(translateY, {
+      toValue: 0,
+      useNativeDriver: true,
+      bounciness: 4
+    }).start();
+  }, [translateY]);
+
+  const closeByDrag = useCallback(() => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    Keyboard.dismiss();
+    Animated.timing(translateY, {
+      toValue: 520,
+      duration: 210,
+      easing: Easing.in(Easing.cubic),
+      useNativeDriver: true
+    }).start(({ finished }) => {
+      translateY.setValue(0);
+      closingRef.current = false;
+      if (finished) onClose?.();
+    });
+  }, [onClose, translateY]);
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 4 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
+    onPanResponderMove: (_, gesture) => {
+      const nextY = Math.max(-46, Math.min(520, gesture.dy));
+      translateY.setValue(nextY);
+    },
+    onPanResponderRelease: (_, gesture) => {
+      if (gesture.dy > 120 || gesture.vy > 1.1) {
+        closeByDrag();
+        return;
+      }
+      snapBack();
+    },
+    onPanResponderTerminate: snapBack
+  }), [closeByDrag, snapBack, translateY]);
+
+  return { translateY, panHandlers: panResponder.panHandlers };
+}
+
+function SheetHandle({ panHandlers }) {
+  return (
+    <View {...(panHandlers || {})} style={styles.handleTouch}>
+      <View style={styles.handle} />
+    </View>
+  );
 }
 
 function StepperBox({ text, onLeft, onRight }) {
@@ -1274,6 +1987,7 @@ function DatePickerButton({ label, value, onPress }) {
 }
 
 function DatePickerModal({ visible, title, value, onCancel, onConfirm }) {
+  const sheetDrag = useBottomSheetDrag(onCancel, visible);
   const [draftDate, setDraftDate] = useState(value || todayKey());
 
   useEffect(() => {
@@ -1283,7 +1997,9 @@ function DatePickerModal({ visible, title, value, onCancel, onConfirm }) {
   return (
     <Modal transparent visible={visible} animationType="fade" onRequestClose={onCancel}>
       <View style={styles.timeModalBackdrop}>
+        <Animated.View style={[styles.sheetAnimatedWrap, { transform: [{ translateY: sheetDrag.translateY }] }]}>
         <View style={styles.dateModalSheet}>
+          <SheetHandle panHandlers={sheetDrag.panHandlers} />
           <View style={styles.timeModalHeader}>
             <Pressable style={styles.timeModalCancel} onPress={onCancel}><Text style={styles.timeModalCancelText}>취소</Text></Pressable>
             <Text style={styles.timeModalTitle}>{title}</Text>
@@ -1299,24 +2015,31 @@ function DatePickerModal({ visible, title, value, onCancel, onConfirm }) {
             </View>
           </View>
         </View>
+        </Animated.View>
       </View>
     </Modal>
   );
 }
 
 function TimePickerInlineOverlay({ title, value, onCancel, onConfirm }) {
+  const sheetDrag = useBottomSheetDrag(onCancel, true);
   return (
     <View style={styles.timeInlineOverlay}>
-      <TimePickerContent title={title} value={value} onCancel={onCancel} onConfirm={onConfirm} />
+      <Animated.View style={[styles.sheetAnimatedWrap, { transform: [{ translateY: sheetDrag.translateY }] }]}>
+        <TimePickerContent title={title} value={value} onCancel={onCancel} onConfirm={onConfirm} panHandlers={sheetDrag.panHandlers} />
+      </Animated.View>
     </View>
   );
 }
 
 function TimePickerModal({ visible, title, value, onCancel, onConfirm }) {
+  const sheetDrag = useBottomSheetDrag(onCancel, visible);
   return (
     <Modal transparent visible={visible} animationType="fade" onRequestClose={onCancel}>
       <View style={styles.timeModalBackdrop}>
-        <TimePickerContent title={title} value={value} onCancel={onCancel} onConfirm={onConfirm} />
+        <Animated.View style={[styles.sheetAnimatedWrap, { transform: [{ translateY: sheetDrag.translateY }] }]}>
+          <TimePickerContent title={title} value={value} onCancel={onCancel} onConfirm={onConfirm} panHandlers={sheetDrag.panHandlers} />
+        </Animated.View>
       </View>
     </Modal>
   );
@@ -1396,7 +2119,7 @@ function WheelColumn({ values, value, onChange, format = (item) => item, repeat 
   );
 }
 
-function TimePickerContent({ title, value, onCancel, onConfirm }) {
+function TimePickerContent({ title, value, onCancel, onConfirm, panHandlers }) {
   const initial = parseTimeParts(value);
   const [period, setPeriod] = useState(initial.period);
   const [hour, setHour] = useState(initial.hour);
@@ -1415,6 +2138,7 @@ function TimePickerContent({ title, value, onCancel, onConfirm }) {
 
   return (
     <View style={styles.timeModalSheet}>
+      <SheetHandle panHandlers={panHandlers} />
       <View style={styles.timeModalHeader}>
         <Pressable style={styles.timeModalCancel} onPress={onCancel}><Text style={styles.timeModalCancelText}>취소</Text></Pressable>
         <Text style={styles.timeModalTitle}>{title}</Text>
@@ -1462,6 +2186,7 @@ const styles = StyleSheet.create({
   sub: { marginTop: 10, color: MUTED, fontSize: 16, fontWeight: "700" },
   socials: { gap: 14 },
   socialButton: { height: 62, borderRadius: 18, borderWidth: 1, borderColor: "#dbe1eb", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 14 },
+  socialButtonDisabled: { opacity: 0.55 },
   socialIcon: { fontSize: 19, fontWeight: "900" },
   socialText: { fontSize: 17, fontWeight: "900" },
   divider: { flexDirection: "row", alignItems: "center", marginVertical: 24 },
@@ -1474,6 +2199,7 @@ const styles = StyleSheet.create({
   requiredStar: { color: priorityColors[1], fontSize: 14, fontWeight: "900", marginLeft: 3 },
   input: { minHeight: 56, borderRadius: 16, backgroundColor: "#eaf0f8", paddingHorizontal: 18, color: INK, fontSize: 16, fontWeight: "700" },
   textArea: { minHeight: 92, paddingTop: 18, textAlignVertical: "top" },
+  authError: { color: "#f04444", fontSize: 13, fontWeight: "800", marginTop: -4, marginBottom: 12 },
   primary: { height: 60, borderRadius: 19, backgroundColor: BLUE, alignItems: "center", justifyContent: "center", marginTop: 12 },
   primaryDisabled: { backgroundColor: "#b8c3ec" },
   primaryText: { color: "#fff", fontSize: 18, fontWeight: "900" },
@@ -1532,12 +2258,17 @@ const styles = StyleSheet.create({
   meta: { color: MUTED, fontSize: 12, fontWeight: "800" },
   priorityTag: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10, fontSize: 12, fontWeight: "900" },
   fieldTag: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10, fontSize: 12, fontWeight: "900" },
-  more: { color: MUTED, fontWeight: "900" },
+  timeTag: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10, backgroundColor: "#eef3ff", color: "#6476c8", fontSize: 12, fontWeight: "900" },
+  more: { color: "#a8b2c5", fontSize: 22, lineHeight: 24, fontWeight: "900" },
   fab: { position: "absolute", right: 26, bottom: 28, width: 66, height: 66, borderRadius: 23, backgroundColor: BLUE, alignItems: "center", justifyContent: "center", shadowColor: BLUE, shadowOpacity: 0.28, shadowRadius: 26, shadowOffset: { width: 0, height: 14 } },
   fabText: { color: "#fff", fontSize: 43, lineHeight: 48, fontWeight: "300" },
   backdrop: { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(0,0,0,0.38)" },
+  sheetAnimatedWrap: { width: "100%" },
   sheet: { maxHeight: "88%", backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 24, paddingTop: 14, paddingBottom: 28 },
-  fieldSheet: { backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 24, paddingTop: 14, paddingBottom: 34 },
+  sheetScrollContent: { paddingBottom: Platform.OS === "ios" ? 28 : 88 },
+  fieldSheet: { maxHeight: "88%", backgroundColor: "#fff", borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 24, paddingTop: 14, paddingBottom: 34 },
+  fieldSheetScrollContent: { paddingBottom: Platform.OS === "ios" ? 28 : 88 },
+  handleTouch: { alignSelf: "stretch", alignItems: "center", paddingTop: 8, marginTop: -8 },
   handle: { alignSelf: "center", width: 45, height: 5, borderRadius: 3, backgroundColor: "#e1e5ec", marginBottom: 18 },
   sheetTitleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   sheetTitle: { color: INK, fontSize: 24, fontWeight: "900" },
@@ -1640,6 +2371,7 @@ const styles = StyleSheet.create({
   topTitle: { color: INK, fontSize: 22, fontWeight: "900" },
   topSpacer: { width: 44 },
   settingsScroll: { paddingBottom: 36 },
+  fieldsScroll: { paddingTop: 16, paddingBottom: 36 },
   tabStatsScroll: { paddingBottom: 120 },
   settingsSection: { color: MUTED, fontSize: 14, fontWeight: "900", marginTop: 18, marginBottom: 10 },
   accountCard: { minHeight: 120, borderRadius: 18, backgroundColor: "#fff", borderWidth: 1, borderColor: LINE, flexDirection: "row", alignItems: "center", padding: 20, gap: 18 },
@@ -1654,10 +2386,14 @@ const styles = StyleSheet.create({
   menuLeft: { flex: 1, color: INK, fontSize: 17, fontWeight: "900" },
   menuRight: { color: MUTED, fontWeight: "900" },
   logoutText: { color: "#f04444", textAlign: "center", marginTop: 22, fontWeight: "900" },
-  fieldRow: { minHeight: 68, borderRadius: 18, backgroundColor: "#fff", borderWidth: 1, borderColor: LINE, marginBottom: 12, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 12 },
+  fieldRow: { height: 68, borderRadius: 18, backgroundColor: "#fff", borderWidth: 1, borderColor: LINE, marginBottom: 12, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 12 },
+  fieldRowDragging: { opacity: 0.94, borderColor: "#c7d3ff", shadowColor: BLUE, shadowOpacity: 0.18, shadowRadius: 18, shadowOffset: { width: 0, height: 10 }, elevation: 8, zIndex: 10 },
+  fieldRowPressArea: { flex: 1, minHeight: 68, flexDirection: "row", alignItems: "center", gap: 12 },
   fieldSwatch: { width: 18, height: 18, borderRadius: 9 },
   fieldName: { flex: 1, color: INK, fontSize: 17, fontWeight: "900" },
   fieldCount: { color: MUTED, fontWeight: "800" },
+  dragHandleTouch: { minWidth: 34, minHeight: 44, alignItems: "center", justifyContent: "center" },
+  dragHandle: { color: "#b6bfd0", fontSize: 20, fontWeight: "900", paddingLeft: 2 },
   rateCard: { borderRadius: 22, backgroundColor: "#fff", borderWidth: 1, borderColor: LINE, padding: 24, alignItems: "center" },
   rate: { color: BLUE, fontSize: 50, fontWeight: "900" },
   rateMsg: { color: MUTED, marginTop: 8, fontWeight: "800", textAlign: "center" },
