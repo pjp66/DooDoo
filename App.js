@@ -56,6 +56,18 @@ const INK = "#07122f";
 const MUTED = "#8b97b4";
 const LINE = "#e2e7f0";
 
+const runHaptic = async (callback) => {
+  try {
+    await callback();
+  } catch (error) {
+    console.warn("Haptic feedback is not available:", error?.message || error);
+  }
+};
+
+const playSelectionHaptic = () => runHaptic(() => Haptics.selectionAsync());
+const playLightHaptic = () => runHaptic(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light));
+const playMediumHaptic = () => runHaptic(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium));
+
 const priorityCopy = {
   1: "오늘 반드시 해야 해요",
   2: "오늘 하면 좋아요",
@@ -137,6 +149,36 @@ const parseTimeParts = (time) => {
 const buildTime = (period, hour, minute) => {
   const hour24 = period === "AM" ? (hour === 12 ? 0 : hour) : (hour === 12 ? 12 : hour + 12);
   return `${pad(hour24)}:${pad(minute)}`;
+};
+const timeToMinutes = (time) => {
+  const [hour, minute] = String(time || "00:00").split(":").map(Number);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return 0;
+  return hour * 60 + minute;
+};
+const addMinutes = (time, minutesToAdd) => {
+  const total = (timeToMinutes(time) + minutesToAdd + 24 * 60) % (24 * 60);
+  const hour = Math.floor(total / 60);
+  const minute = total % 60;
+  return `${pad(hour)}:${pad(minute)}`;
+};
+const COMPLETED_DOT_COLOR = "#aab4c6";
+const getTaskPriority = (task) => {
+  const priority = Number(task?.priority);
+  return [1, 2, 3].includes(priority) ? priority : 3;
+};
+const isTaskDone = (task) => Boolean(task?.isCompleted ?? task?.done ?? task?.is_completed);
+const getCalendarDotsForDate = (tasks, dateKey) => {
+  const dateTasks = tasks.filter((task) => task.date === dateKey);
+  const sorted = [...dateTasks].sort((a, b) => {
+    const doneDiff = Number(isTaskDone(a)) - Number(isTaskDone(b));
+    if (doneDiff !== 0) return doneDiff;
+    if (!isTaskDone(a) && !isTaskDone(b)) return getTaskPriority(a) - getTaskPriority(b);
+    return 0;
+  });
+
+  return sorted.slice(0, 3).map((task) => (
+    isTaskDone(task) ? COMPLETED_DOT_COLOR : priorityColors[getTaskPriority(task)]
+  ));
 };
 const formatClock = (time) => {
   if (!time) return "";
@@ -993,14 +1035,14 @@ function Calendar({ mode, selectedDate, tasks, onSelect }) {
         <View style={styles.calendarGrid}>
           {days.map((key) => {
             const date = dateOf(key);
-            const count = tasks.filter((task) => task.date === key).length;
+            const dots = getCalendarDotsForDate(tasks, key);
             const isSelected = key === selectedDate;
             const faded = mode === "month" && date.getMonth() !== selected.getMonth();
             return (
               <Pressable key={key} onPress={() => onSelect(key)} style={[styles.dayCell, mode === "week" && styles.weekCell, isSelected && styles.selectedDay]}>
                 <Text style={[styles.dayNum, faded && styles.faded, date.getDay() === 0 && styles.sun, date.getDay() === 6 && styles.sat, isSelected && styles.selectedDayText]}>{date.getDate()}</Text>
                 <View style={styles.dots}>
-                  {Array.from({ length: Math.min(count, 3) }).map((_, index) => <View key={index} style={[styles.dot, isSelected && styles.selectedDot]} />)}
+                  {dots.map((color, index) => <View key={`${key}-${index}`} style={[styles.dot, { backgroundColor: color }, isSelected && styles.selectedDot]} />)}
                 </View>
               </Pressable>
             );
@@ -2234,7 +2276,7 @@ const styles = StyleSheet.create({
   faded: { color: "#c0c7d5" },
   dots: { height: 7, flexDirection: "row", gap: 3, marginTop: 3 },
   dot: { width: 5, height: 5, borderRadius: 3, backgroundColor: "#335be6" },
-  selectedDot: { backgroundColor: "#9db1ff" },
+  selectedDot: { borderWidth: 0.5, borderColor: "rgba(255,255,255,0.75)" },
   dividerLine: { height: 1, backgroundColor: LINE, marginTop: 10 },
   listContent: { paddingBottom: 112 },
   daySummary: { marginTop: 16, flexDirection: "row", alignItems: "baseline", flexWrap: "wrap", gap: 8 },

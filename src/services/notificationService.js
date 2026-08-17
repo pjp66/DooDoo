@@ -1,5 +1,7 @@
-import { Alert } from "react-native";
 import * as Device from "expo-device";
+import * as Notifications from "expo-notifications";
+
+const CHANNEL_ID = "doodoo-tasks";
 
 const REMINDER_OFFSETS = {
   at_start: 0,
@@ -9,18 +11,57 @@ const REMINDER_OFFSETS = {
   before_60: 60
 };
 
+const REMINDER_LABELS = {
+  at_start: "\uc2dc\uc791 \uc2dc\uac04",
+  before_5: "5\ubd84 \uc804",
+  before_10: "10\ubd84 \uc804",
+  before_30: "30\ubd84 \uc804",
+  before_60: "1\uc2dc\uac04 \uc804",
+  custom: "\uc9c1\uc811 \uc124\uc815"
+};
+
 const pad = (value) => String(value).padStart(2, "0");
+
+try {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowAlert: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false
+    })
+  });
+} catch (error) {
+  console.warn("[DooDoo] Notification handler setup failed:", error?.message || error);
+}
 
 function dateFromKeyAndTime(dateKey, timeKey) {
   if (!dateKey || !timeKey) return null;
+
   const [year, month, day] = String(dateKey).split("-").map(Number);
   const [hour, minute] = String(timeKey).split(":").map(Number);
+
   if (![year, month, day, hour, minute].every(Number.isFinite)) return null;
   return new Date(year, month - 1, day, hour, minute, 0, 0);
 }
 
 function addMinutes(date, minutes) {
   return new Date(date.getTime() + minutes * 60 * 1000);
+}
+
+async function ensureAndroidChannel() {
+  if (Device.osName !== "Android") return;
+
+  try {
+    await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
+      name: "DooDoo",
+      importance: Notifications.AndroidImportance?.HIGH ?? 4,
+      sound: "default",
+      vibrationPattern: [0, 220, 120, 220],
+      lockscreenVisibility: Notifications.AndroidNotificationVisibility?.PUBLIC
+    });
+  } catch (error) {
+    console.warn("[DooDoo] Android notification channel setup failed:", error?.message || error);
+  }
 }
 
 export function getReminderBody(task) {
@@ -34,48 +75,107 @@ export function getReminderBody(task) {
 }
 
 export function getTaskNotificationDate(task) {
-  if (!task || task.isCompleted || task.done || task.reminderType === "none") return null;
+  const reminderType = task?.reminderType || "none";
+  if (!task || task.isCompleted || task.done || reminderType === "none") return null;
 
-  if (task.reminderType === "custom") {
+  if (reminderType === "custom") {
     return dateFromKeyAndTime(task.reminderDate || task.date, task.reminderTime);
   }
 
-  if (!(task.reminderType in REMINDER_OFFSETS) || task.isAllDay || !task.startTime) return null;
+  if (!(reminderType in REMINDER_OFFSETS) || task.isAllDay || !task.startTime) return null;
+
   const startDate = dateFromKeyAndTime(task.startDate || task.date, task.startTime);
   if (!startDate) return null;
-  return addMinutes(startDate, -REMINDER_OFFSETS[task.reminderType]);
+
+  return addMinutes(startDate, -REMINDER_OFFSETS[reminderType]);
 }
 
 export function formatNotificationDate(date) {
   if (!date) return "";
+
   const period = date.getHours() >= 12 ? "\uc624\ud6c4" : "\uc624\uc804";
   const hour12 = date.getHours() % 12 || 12;
+
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${period} ${hour12}:${pad(date.getMinutes())}`;
 }
 
 export async function requestNotificationPermission({ showAlert = true } = {}) {
   if (!Device.isDevice) {
     if (showAlert) {
-      Alert.alert("\uc54c\ub9bc \uc548\ub0b4", "\uc2e4\uc81c \uae30\uae30\uc5d0\uc11c\ub9cc \uc54c\ub9bc\uc744 \ubc1b\uc744 \uc218 \uc788\uc5b4\uc694.");
+      console.warn("[DooDoo] Notifications require a physical device.");
     }
     return false;
   }
 
-  if (showAlert) {
-    Alert.alert(
-      "\uc54c\ub9bc \uc900\ube44 \uc911",
-      "Expo Go\uc5d0\uc11c \uc54c\ub9bc \ubaa8\ub4c8\uc744 \ubd88\ub7ec\uc624\ub294 \uc911 \uc624\ub958\uac00 \uc788\uc5b4 \uc9c0\uae08\uc740 \uc54c\ub9bc \uac12\ub9cc \uc800\uc7a5\ud574\uc694. \uc571\uc774 \uaebc\uc9c0\uc9c0 \uc54a\ub3c4\ub85d \uc784\uc2dc\ub85c \uc608\uc57d\uc740 \uaebc\ub450\uc5c8\uc5b4\uc694."
-    );
+  try {
+    const current = await Notifications.getPermissionsAsync();
+    let finalStatus = current.status;
+
+    if (current.status !== "granted") {
+      const requested = await Notifications.requestPermissionsAsync({
+        ios: {
+          allowAlert: true,
+          allowBadge: false,
+          allowSound: true
+        }
+      });
+      finalStatus = requested.status;
+    }
+
+    const granted = finalStatus === "granted";
+    if (!granted && showAlert) {
+      console.warn("[DooDoo] Notification permission was not granted.");
+    }
+
+    if (granted) await ensureAndroidChannel();
+    return granted;
+  } catch (error) {
+    console.warn("[DooDoo] Notification permission failed:", error?.message || error);
+    return false;
   }
-  return false;
 }
 
-export async function cancelTaskNotification() {
-  return;
+export async function cancelTaskNotification(notificationId) {
+  if (!notificationId) return;
+
+  try {
+    await Notifications.cancelScheduledNotificationAsync(notificationId);
+  } catch (error) {
+    console.warn("[DooDoo] Cancel notification failed:", error?.message || error);
+  }
 }
 
 export async function cancelAllTaskNotifications() {
-  return;
+  try {
+    await Notifications.cancelAllScheduledNotificationsAsync();
+  } catch (error) {
+    console.warn("[DooDoo] Cancel all notifications failed:", error?.message || error);
+  }
+}
+
+function getNotificationContent(task) {
+  return {
+    title: task.title || "DooDoo",
+    body: getReminderBody(task),
+    sound: "default",
+    data: {
+      taskId: task.id,
+      reminderType: task.reminderType || "none",
+      reminderLabel: REMINDER_LABELS[task.reminderType] || ""
+    }
+  };
+}
+
+function getDateTrigger(date) {
+  if (Notifications.SchedulableTriggerInputTypes?.DATE) {
+    return {
+      type: Notifications.SchedulableTriggerInputTypes.DATE,
+      date,
+      channelId: CHANNEL_ID
+    };
+  }
+
+  return date;
 }
 
 export async function scheduleTaskNotification(
@@ -87,13 +187,32 @@ export async function scheduleTaskNotification(
 
   if (triggerDate.getTime() <= Date.now()) {
     if (showPastAlert) {
-      Alert.alert("\uc54c\ub9bc \uc2dc\uac04", "\uc774\ubbf8 \uc9c0\ub09c \uc2dc\uac04\uc774\ub77c \uc54c\ub9bc\uc744 \uc124\uc815\ud560 \uc218 \uc5c6\uc5b4\uc694.");
+      console.warn("[DooDoo] Notification time is already in the past.");
     }
-    return { task: { ...task, notificationId: null }, status: "past" };
+    return { task: { ...task, notificationId: null }, status: "past", triggerDate };
   }
 
-  await requestNotificationPermission({ showAlert: showPermissionAlert });
-  return { task: { ...task, notificationId: null }, status: "unsupported", triggerDate };
+  const hasPermission = await requestNotificationPermission({ showAlert: showPermissionAlert });
+  if (!hasPermission) {
+    return { task: { ...task, notificationId: null }, status: "permission-denied", triggerDate };
+  }
+
+  try {
+    const notificationId = await Notifications.scheduleNotificationAsync({
+      content: getNotificationContent(task),
+      trigger: getDateTrigger(triggerDate)
+    });
+
+    return {
+      task: { ...task, notificationId },
+      status: "scheduled",
+      notificationId,
+      triggerDate
+    };
+  } catch (error) {
+    console.warn("[DooDoo] Schedule notification failed:", error?.message || error);
+    return { task: { ...task, notificationId: null }, status: "failed", error, triggerDate };
+  }
 }
 
 export async function prepareTaskNotification(nextTask, previousTask = null, options = {}) {
@@ -110,5 +229,24 @@ export async function prepareTaskNotification(nextTask, previousTask = null, opt
 }
 
 export async function resyncTaskNotifications(tasks = []) {
-  return tasks.map((task) => ({ ...task, notificationId: null }));
+  const nextTasks = [];
+
+  for (const task of tasks) {
+    if (task.notificationId) {
+      await cancelTaskNotification(task.notificationId);
+    }
+
+    if (task.isCompleted || task.done || task.reminderType === "none") {
+      nextTasks.push({ ...task, notificationId: null });
+      continue;
+    }
+
+    const result = await scheduleTaskNotification(task, {
+      showPermissionAlert: false,
+      showPastAlert: false
+    });
+    nextTasks.push(result.task);
+  }
+
+  return nextTasks;
 }
